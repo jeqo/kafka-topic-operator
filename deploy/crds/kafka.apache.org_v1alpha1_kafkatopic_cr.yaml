@@ -7,3 +7,4 @@ spec:
   replicationFactor: 1
   topicConfig:
     cleanup.policy: compact
+    max.message.bytes: "500002"

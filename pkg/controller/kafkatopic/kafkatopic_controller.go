@@ -2,6 +2,7 @@ package kafkatopic
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"time"
 
@@ -155,14 +156,19 @@ func (r *ReconcileKafkaTopic) Reconcile(request reconcile.Request) (reconcile.Re
 	// Check if Kafka Topic already exists
 	metadata, err := admin.GetMetadata(&topicName, false, 20000)
 
-	if err != nil {
-		reqLogger.Error(err, "Error getting topic metadata")
-		return reconcile.Result{}, err
-	}
+	// if err != nil {
+	// 	reqLogger.Error(err, "Error getting topic metadata")
+	// 	return reconcile.Result{}, err
+	// }
 
-	if metadata.Topics[topicName].Error.Code() == kafka.ErrUnknownTopic {
-		reqLogger.Info("Topic does not exist, creating a new Kafka Topic")
-		topicsCreated, err := admin.CreateTopics(
+	topicMetadata := metadata.Topics[topicName]
+
+	if topicMetadata.Error.Code() == kafka.ErrUnknownTopicOrPart {
+		reqLogger.Info("Topic does not exist, creating a new Kafka Topic",
+			"KafkaTopic.Partitions", partitions,
+			"KafkaTopic.ReplicationFactor", replicationFactor,
+			"KafkaTopic.Config", topicConfig)
+		_, err := admin.CreateTopics(
 			ctx,
 			// Multiple topics can be created simultaneously
 			// by providing more TopicSpecification structs here.
@@ -175,13 +181,14 @@ func (r *ReconcileKafkaTopic) Reconcile(request reconcile.Request) (reconcile.Re
 			kafka.SetAdminOperationTimeout(maxDur))
 
 		if err != nil {
+			reqLogger.Error(err, "Error creating topic")
 			return reconcile.Result{}, err
 		}
 
-		result := topicsCreated[0]
-		if result.Error.Code() != kafka.ErrNoError {
-			return reconcile.Result{}, metadata.Topics[topicName].Error
-		}
+		// result := topicsCreated[0]
+		// if result.Error.Code() != kafka.ErrNoError {
+		// 	return reconcile.Result{}, metadata.Topics[topicName].Error
+		// }
 		return reconcile.Result{}, nil
 	}
 
@@ -190,32 +197,44 @@ func (r *ReconcileKafkaTopic) Reconcile(request reconcile.Request) (reconcile.Re
 		[]kafka.ConfigResource{{Type: resourceType, Name: topicName}})
 
 	if err != nil {
+		reqLogger.Error(err, "Error describing topic")
 		return reconcile.Result{}, err
 	}
 
 	result := results[0]
-	if result.Error.Code() != kafka.ErrNoError {
-		return reconcile.Result{}, metadata.Topics[topicName].Error
-	}
+	// if result.Error.Code() != kafka.ErrNoError {
+	// 	return reconcile.Result{}, metadata.Topics[topicName].Error
+	// }
 
 	// Check if config has changed
 	currentConfig := make(map[string]string)
 	changed := false
 
+	// fmt.Printf("KafkaTopic config: %v\n", topicConfig)
+	// fmt.Printf("KafkaTopic config on server: %v\n", result.Config)
+
 	for _, entry := range result.Config {
-		currentConfig[entry.Name] = entry.Value
-		if topicConfig[entry.Name] != entry.Value {
-			topicConfig[entry.Name] = entry.Value
-			changed = true
+		if len(topicConfig[entry.Name]) == 0 {
+			currentConfig[entry.Name] = entry.Value
+		} else {
+			if topicConfig[entry.Name] != entry.Value {
+				changed = true
+				currentConfig[entry.Name] = topicConfig[entry.Name]
+			} else {
+				currentConfig[entry.Name] = entry.Value
+			}
 		}
 	}
 
+	reqLogger.Info("KafkaTopic configuration has changed", "KafkTopic.Changed", changed)
 	if changed {
 		config := make([]kafka.ConfigEntry, 0)
 		for tc := range topicConfig {
-			configEntry := kafka.ConfigEntry{Name: tc, Value: topicConfig[tc], Operation: kafka.AlterOperationSet}
+			configEntry := kafka.ConfigEntry{Name: tc, Value: topicConfig[tc]}
 			config = append(config, configEntry)
 		}
+
+		fmt.Printf("KafkaTopic config to be updated: %v\n", config)
 
 		kafkaTopic.Spec.TopicConfig = currentConfig
 		_, err := admin.AlterConfigs(ctx, []kafka.ConfigResource{{Type: resourceType, Name: topicName, Config: config}})
