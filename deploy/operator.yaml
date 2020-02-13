@@ -31,3 +31,5 @@ spec:
                   fieldPath: metadata.name
             - name: OPERATOR_NAME
               value: "kafka-topic-operator"
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: localhost:9092

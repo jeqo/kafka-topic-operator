@@ -2,7 +2,7 @@ package kafkatopic
 
 import (
 	"context"
-	"fmt"
+	"os"
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/kafka"
@@ -103,14 +103,15 @@ func (r *ReconcileKafkaTopic) Reconcile(request reconcile.Request) (reconcile.Re
 		return reconcile.Result{}, err
 	}
 
+	kafkaBootstrapServers := os.Getenv("KAFKA_BOOTSTRAP_SERVERS")
+
 	// Initializing Kafka Admin Client
-	a, err := kafka.NewAdminClient(&kafka.ConfigMap{"bootstrap.servers": kafkaTopic.GetLabels()["kafkaBootstrapServers"]})
+	admin, err := kafka.NewAdminClient(&kafka.ConfigMap{"bootstrap.servers": kafkaBootstrapServers})
 	if err != nil {
-		fmt.Printf("Failed to create Admin client: %s\n", err)
+		reqLogger.Error(err, "Failed to create Admin client: %s\n")
 	}
 
-	defer a.Close()
-
+	// defer admin.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -121,20 +122,47 @@ func (r *ReconcileKafkaTopic) Reconcile(request reconcile.Request) (reconcile.Re
 
 	topicName := request.Name
 
+	toBeDeleted := kafkaTopic.GetDeletionTimestamp() != nil
+	if toBeDeleted {
+		reqLogger.Info("KafkaTopic to be deleted")
+		if contains(kafkaTopic.GetFinalizers(), kafkaTopicFinalizer) {
+			results, err := admin.DeleteTopics(ctx, []string{topicName})
+			reqLogger.Info("KafkaTopic to be deleted", "DeleteResults", results[0])
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+
+			kafkaTopic.SetFinalizers(remove(kafkaTopic.GetFinalizers(), kafkaTopicFinalizer))
+			err = r.client.Update(context.TODO(), kafkaTopic)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+		}
+		return reconcile.Result{}, nil
+	}
+
+	if !contains(kafkaTopic.GetFinalizers(), kafkaTopicFinalizer) {
+		reqLogger.Info("Setting KafkaTopic finalizer")
+		if err := r.addFinalizer(reqLogger, kafkaTopic); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
 	partitions := kafkaTopic.Spec.Partitions
 	replicationFactor := kafkaTopic.Spec.ReplicationFactor
 	topicConfig := kafkaTopic.Spec.TopicConfig
 
 	// Check if Kafka Topic already exists
-	metadata, err := a.GetMetadata(&topicName, false, 20000)
+	metadata, err := admin.GetMetadata(&topicName, false, 20000)
 
 	if err != nil {
+		reqLogger.Error(err, "Error getting topic metadata")
 		return reconcile.Result{}, err
 	}
 
 	if metadata.Topics[topicName].Error.Code() == kafka.ErrUnknownTopic {
 		reqLogger.Info("Topic does not exist, creating a new Kafka Topic")
-		topicsCreated, err := a.CreateTopics(
+		topicsCreated, err := admin.CreateTopics(
 			ctx,
 			// Multiple topics can be created simultaneously
 			// by providing more TopicSpecification structs here.
@@ -155,12 +183,10 @@ func (r *ReconcileKafkaTopic) Reconcile(request reconcile.Request) (reconcile.Re
 			return reconcile.Result{}, metadata.Topics[topicName].Error
 		}
 		return reconcile.Result{}, nil
-	} else if metadata.Topics[topicName].Error.Code() != kafka.ErrNoError {
-		return reconcile.Result{}, metadata.Topics[topicName].Error
 	}
 
 	resourceType, err := kafka.ResourceTypeFromString("TOPIC")
-	results, err := a.DescribeConfigs(ctx,
+	results, err := admin.DescribeConfigs(ctx,
 		[]kafka.ConfigResource{{Type: resourceType, Name: topicName}})
 
 	if err != nil {
@@ -192,7 +218,7 @@ func (r *ReconcileKafkaTopic) Reconcile(request reconcile.Request) (reconcile.Re
 		}
 
 		kafkaTopic.Spec.TopicConfig = currentConfig
-		_, err := a.AlterConfigs(ctx, []kafka.ConfigResource{{Type: resourceType, Name: topicName, Config: config}})
+		_, err := admin.AlterConfigs(ctx, []kafka.ConfigResource{{Type: resourceType, Name: topicName, Config: config}})
 		if err != nil {
 			return reconcile.Result{}, err
 		}
@@ -201,29 +227,6 @@ func (r *ReconcileKafkaTopic) Reconcile(request reconcile.Request) (reconcile.Re
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{Requeue: true}, nil
-	}
-
-	toBeDeleted := kafkaTopic.GetDeletionTimestamp() != nil
-	if toBeDeleted {
-		if contains(kafkaTopic.GetFinalizers(), kafkaTopicFinalizer) {
-			_, err = a.DeleteTopics(ctx, []string{topicName})
-			if err != nil {
-				return reconcile.Result{}, err
-			}
-
-			kafkaTopic.SetFinalizers(remove(kafkaTopic.GetFinalizers(), kafkaTopicFinalizer))
-			err := r.client.Update(context.TODO(), kafkaTopic)
-			if err != nil {
-				return reconcile.Result{}, err
-			}
-		}
-		return reconcile.Result{}, nil
-	}
-
-	if !contains(kafkaTopic.GetFinalizers(), kafkaTopicFinalizer) {
-		if err := r.addFinalizer(reqLogger, kafkaTopic); err != nil {
-			return reconcile.Result{}, err
-		}
 	}
 
 	return reconcile.Result{}, nil
